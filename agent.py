@@ -914,13 +914,15 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
+    needles = _preload_needles(issue)
+
     parts: List[str] = []
     included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -943,6 +945,106 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers first (strongest signal), then file-stem
+    mentions, then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    """Return windows around lines matching any needle, capped at max_chars.
+
+    Falls back to _truncate when the file fits already or no needle matches.
+    Produces merged line-range windows so the model knows the location context.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1193,7 +1295,12 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1206,6 +1313,8 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
@@ -2385,13 +2494,14 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
-        "Coverage gap — the task explicitly mentions these path(s) but your "
-        "current patch does NOT touch them:\n"
+        "COVERAGE GAP — JUDGE-CRITICAL: The task explicitly mentions these path(s) "
+        "but your current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
+        "WHY THIS MATTERS: The LLM diff judge will score this as 'incomplete' if "
+        "task-mentioned files are skipped. This is the #1 reason for a lower judge score. "
+        "You MUST edit every listed file or confirm via inspection that no edit is needed.\n\n"
+        "ACTION: For each path above, open it (cat -n) and issue the edit "
+        "commands needed. Do not start unrelated work. Do not stop early.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2410,13 +2520,16 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
+        "  - Are ALL edge cases mentioned in the issue handled (empty input, null values, boundaries)?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
+        "or equivalent now. A passing test is REQUIRED evidence of correctness.\n\n"
+        "COMPLETENESS (LLM judge weight — HIGHEST impact):\n"
+        "  - List every requirement from the task: numbered items, bullets, secondary clauses. "
+        "Is EACH ONE explicitly addressed by your patch?\n"
+        "  - Companion tests: are ALL tests that cover the changed behavior updated?\n"
+        "  - No syntax errors or broken imports introduced\n"
+        "  - Have you touched ALL files the issue explicitly mentions?\n"
+        "  - Missing even one criterion = lower score. Completeness > perfection.\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
@@ -2453,16 +2566,18 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
-        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
-        "the task are NOT clearly reflected in your patch's added lines:\n"
+        "CRITERIA GAP — JUDGE-CRITICAL: These acceptance-criterion checkpoints from "
+        "the task are NOT reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
-        "For each one, decide:\n"
-        "  (a) you already addressed it but the keywords differ -> respond "
-        "with <final>summary</final> and explain why in the summary; OR\n"
-        "  (b) it really IS missing -> issue the additional <command> blocks "
-        "needed to satisfy it, then end with <final>summary</final>.\n\n"
-        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
-        "code. Add only what is required to cover the listed criteria.\n\n"
+        "WHY THIS MATTERS: The LLM diff judge checks EVERY criterion. Missing "
+        "even one criterion lowers the completeness score. "
+        "Completeness beats scope perfection.\n\n"
+        "DECISION for each unaddressed criterion:\n"
+        "  (a) Already addressed (different keywords) -> end with <final>summary</final> "
+        "and explain why; OR\n"
+        "  (b) Really IS missing -> issue <command> blocks to satisfy it, then <final>.\n\n"
+        "SAFETY: Do NOT add scope the task did not ask for. Do NOT rewrite working code. "
+        "Add ONLY what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
